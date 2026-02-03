@@ -108,6 +108,9 @@ public class ReportServiceImpl implements ReportService {
 	}
 	
 	private String buildTitle(String reportType) {
+		if (reportType == null || reportType.isEmpty()) {
+			return "Scouting Report";
+		}
 		return "Scouting Report - " +
 				       reportType.replace("_", " ").toUpperCase();
 	}
@@ -119,6 +122,9 @@ public class ReportServiceImpl implements ReportService {
 		List<ScoutingReportResponse.ReportSection> sections = new ArrayList<>();
 		try {
 			JsonNode root = objectMapper.readTree(reportData);
+			if (root == null || !root.isObject()) {
+				return Collections.emptyList();
+			}
 			AtomicInteger order = new AtomicInteger(1);
 			root.fields().forEachRemaining(entry -> sections.add(
 				ScoutingReportResponse.ReportSection

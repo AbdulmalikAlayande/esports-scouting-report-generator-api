@@ -40,14 +40,15 @@ class ReportServiceTest {
     private ScoutingReportRepository scoutingReportRepository;
     @Mock
     private ModelMapper mapper;
-    @Mock
-    private ObjectMapper objectMapper;
     
+    private ObjectMapper objectMapper;
     private ReportService reportService;
     private Validator validator;
 
     @BeforeEach
     void setUp() {
+        // Use real ObjectMapper for JSON parsing tests
+        objectMapper = new ObjectMapper();
         reportService = new ReportServiceImpl(mapper, objectMapper, reportRequestRepository, scoutingReportRepository);
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             validator = factory.getValidator();
@@ -60,10 +61,14 @@ class ReportServiceTest {
 
         @Test
         @DisplayName("Should create a PENDING report request when given a valid prompt")
-        void shouldCreatePendingRequest_WhenPromptIsValid() {
+        void shouldCreatePendingRequest_WhenPromptIsValid() throws Exception {
             // Given
             String validPrompt = "This is a valid scouting report request prompt with enough length.";
             GenerateReportRequest request = new GenerateReportRequest(validPrompt);
+            
+            ReportRequest reportRequest = new ReportRequest();
+            reportRequest.setUserPrompt(validPrompt);
+            when(mapper.map(request, ReportRequest.class)).thenReturn(reportRequest);
             
             when(reportRequestRepository.save(any(ReportRequest.class))).thenAnswer(invocation -> {
                 ReportRequest r = invocation.getArgument(0);
@@ -117,6 +122,9 @@ class ReportServiceTest {
         void shouldHandleDatabaseFailure() {
             // Given
             GenerateReportRequest request = new GenerateReportRequest("Valid prompt for scouting report generator.");
+            ReportRequest reportRequest = new ReportRequest();
+            reportRequest.setUserPrompt(request.getUserPrompt());
+            when(mapper.map(request, ReportRequest.class)).thenReturn(reportRequest);
             when(reportRequestRepository.save(any())).thenThrow(new RuntimeException("DB Error"));
 
             // When / Then
@@ -127,10 +135,14 @@ class ReportServiceTest {
 
         @Test
         @DisplayName("Should handle special characters in prompt")
-        void shouldHandleSpecialCharactersInPrompt() {
+        void shouldHandleSpecialCharactersInPrompt() throws Exception {
             // Given
             String specialPrompt = "Scouting for @Team! With #Special chars & symbols? (Hopefully) works fine.";
             GenerateReportRequest request = new GenerateReportRequest(specialPrompt);
+
+            ReportRequest reportRequest = new ReportRequest();
+            reportRequest.setUserPrompt(specialPrompt);
+            when(mapper.map(request, ReportRequest.class)).thenReturn(reportRequest);
 
             when(reportRequestRepository.save(any(ReportRequest.class))).thenAnswer(invocation -> {
                 ReportRequest r = invocation.getArgument(0);
@@ -241,6 +253,7 @@ class ReportServiceTest {
 
             ScoutingReport report = new ScoutingReport();
             report.setReportRequest(request);
+            report.setReportType("VALORANT_PRO"); // Set reportType to avoid NPE in buildTitle
             report.setReportData("{invalid-json}");
             
             when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
