@@ -9,8 +9,10 @@ import app.bola.cloud9stratigenai.dto.ReportStatusResponse;
 import app.bola.cloud9stratigenai.dto.ScoutingReportResponse;
 import app.bola.cloud9stratigenai.exception.ReportNotFoundException;
 import app.bola.cloud9stratigenai.exception.ReportNotReadyException;
+import app.bola.cloud9stratigenai.model.ReportJob;
 import app.bola.cloud9stratigenai.model.ReportRequest;
 import app.bola.cloud9stratigenai.model.ScoutingReport;
+import app.bola.cloud9stratigenai.repository.ReportJobRepository;
 import app.bola.cloud9stratigenai.repository.ReportRequestRepository;
 import app.bola.cloud9stratigenai.repository.ScoutingReportRepository;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -22,10 +24,15 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
@@ -33,20 +40,47 @@ import java.util.concurrent.atomic.AtomicInteger;
 @AllArgsConstructor
 public class ReportServiceImpl implements ReportService {
 
+    private static final int DEFAULT_MAX_ATTEMPTS = 5;
+
     private final ModelMapper mapper;
     private final ObjectMapper objectMapper;
     private final ReportRequestRepository reportRequestRepository;
     private final ScoutingReportRepository scoutingReportRepository;
+    private final ReportJobRepository reportJobRepository;
 
     @Override
     @Transactional
     public ReportStatusResponse generateReport(GenerateReportRequest request) {
         validateRequest(request);
+
+        String requestHash = hashPrompt(request.getUserPrompt());
+        Optional<ReportRequest> existing = reportRequestRepository.findFirstByRequestHashAndStatusInOrderByCreatedAtDesc(
+                requestHash,
+                List.of(ReportRequest.ReportStatus.PENDING, ReportRequest.ReportStatus.PROCESSING, ReportRequest.ReportStatus.COMPLETED)
+        );
+
+        if (existing.isPresent()) {
+            ReportRequest existingRequest = existing.get();
+            boolean reportAvailable = scoutingReportRepository.existsByReportRequestPublicId(existingRequest.getPublicId());
+            return buildReportStatusResponse(existingRequest, reportAvailable, reportJobRepository.findByReportRequestId(existingRequest.getId()).orElse(null));
+        }
+
         ReportRequest reportRequest = mapper.map(request, ReportRequest.class);
         reportRequest.setStatus(ReportRequest.ReportStatus.PENDING);
+        reportRequest.setRequestHash(requestHash);
 
         ReportRequest savedRequest = reportRequestRepository.save(reportRequest);
-        return buildReportStatusResponse(savedRequest, false);
+
+        ReportJob reportJob = new ReportJob();
+        reportJob.setReportRequest(savedRequest);
+        reportJob.setState(ReportJob.JobState.QUEUED);
+        reportJob.setCurrentStage(ReportJob.JobStage.INGESTING);
+        reportJob.setAttempt(0);
+        reportJob.setMaxAttempts(DEFAULT_MAX_ATTEMPTS);
+        reportJob.setNextRunAt(LocalDateTime.now());
+        reportJobRepository.save(reportJob);
+
+        return buildReportStatusResponse(savedRequest, false, reportJob);
     }
 
     @Override
@@ -54,7 +88,8 @@ public class ReportServiceImpl implements ReportService {
     public ReportStatusResponse getReportStatus(String requestId) {
         ReportRequest request = findRequestOrThrow(requestId);
         boolean isAvailable = scoutingReportRepository.existsByReportRequestPublicId(requestId);
-        return buildReportStatusResponse(request, isAvailable);
+        ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
+        return buildReportStatusResponse(request, isAvailable, reportJob);
     }
 
     @Override
@@ -66,7 +101,8 @@ public class ReportServiceImpl implements ReportService {
         }
         ScoutingReport scoutingReport = scoutingReportRepository.findByReportRequestId(request.getId())
                 .orElseThrow(() -> new ReportNotFoundException("Scouting report data not found for request: " + requestId));
-        return mapToResponse(scoutingReport);
+        ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
+        return mapToResponse(scoutingReport, reportJob);
     }
 
     private ReportRequest findRequestOrThrow(String publicId) {
@@ -74,7 +110,7 @@ public class ReportServiceImpl implements ReportService {
                 .orElseThrow(() -> new ReportNotFoundException(publicId));
     }
 
-    private ScoutingReportResponse mapToResponse(ScoutingReport report) {
+    private ScoutingReportResponse mapToResponse(ScoutingReport report, ReportJob reportJob) {
         JsonNode reportRoot = parseReportRoot(report.getReportData());
 
         return ScoutingReportResponse.builder()
@@ -90,22 +126,22 @@ public class ReportServiceImpl implements ReportService {
                 .generatedAt(report.getCreatedAt())
                 .lineage(ScoutingReportResponse.Lineage.builder()
                         .requestId(report.getReportRequest().getPublicId())
-                        .jobId(null)
-                        .attempt(1)
+                        .jobId(reportJob != null ? reportJob.getId() : null)
+                        .attempt(reportJob != null ? reportJob.getAttempt() : 1)
                         .build())
                 .build();
     }
 
-    private ReportStatusResponse buildReportStatusResponse(ReportRequest request, boolean reportAvailable) {
-        WorkflowState workflowState = ReportStateMapper.toWorkflowState(request.getStatus());
-        ErrorClassification classification = classifyError(request.getStatus(), request.getErrorMessage());
+    private ReportStatusResponse buildReportStatusResponse(ReportRequest request, boolean reportAvailable, ReportJob reportJob) {
+        WorkflowState workflowState = resolveWorkflowState(request, reportJob);
+        ErrorClassification classification = classifyError(request, reportJob);
 
         return ReportStatusResponse.builder()
                 .requestId(request.getPublicId())
                 .status(request.getStatus().name())
-                .message(getCurrentStep(request.getStatus()))
-                .progress(calculateProgress(request.getStatus()))
-                .currentStep(getCurrentStep(request.getStatus()))
+                .message(resolveCurrentStep(request.getStatus(), reportJob))
+                .progress(resolveProgress(request.getStatus(), reportJob))
+                .currentStep(resolveCurrentStep(request.getStatus(), reportJob))
                 .createdAt(request.getCreatedAt())
                 .reportAvailable(reportAvailable)
                 .completedAt(request.getCompletedAt())
@@ -115,6 +151,61 @@ public class ReportServiceImpl implements ReportService {
                 .retryable(classification.retryable)
                 .contractVersion(ContractVersions.REPORT_STATUS_V1)
                 .build();
+    }
+
+    private WorkflowState resolveWorkflowState(ReportRequest request, ReportJob reportJob) {
+        if (reportJob != null && reportJob.getCurrentStage() != null) {
+            return switch (reportJob.getCurrentStage()) {
+                case INGESTING -> WorkflowState.INGESTING;
+                case FEATURIZING -> WorkflowState.FEATURIZING;
+                case SYNTHESIZING -> WorkflowState.SYNTHESIZING;
+                case COMPOSING -> WorkflowState.COMPOSING;
+                case READY -> WorkflowState.READY;
+                case FAILED -> WorkflowState.FAILED;
+            };
+        }
+
+        return ReportStateMapper.toWorkflowState(request.getStatus());
+    }
+
+    private int resolveProgress(ReportRequest.ReportStatus status, ReportJob reportJob) {
+        if (reportJob != null && reportJob.getCurrentStage() != null) {
+            return switch (reportJob.getCurrentStage()) {
+                case INGESTING -> 20;
+                case FEATURIZING -> 40;
+                case SYNTHESIZING -> 70;
+                case COMPOSING -> 90;
+                case READY -> 100;
+                case FAILED -> -1;
+            };
+        }
+
+        return switch (status) {
+            case PENDING -> 0;
+            case PROCESSING -> 50;
+            case COMPLETED -> 100;
+            case FAILED -> -1;
+        };
+    }
+
+    private String resolveCurrentStep(ReportRequest.ReportStatus status, ReportJob reportJob) {
+        if (reportJob != null && reportJob.getCurrentStage() != null) {
+            return switch (reportJob.getCurrentStage()) {
+                case INGESTING -> "Ingesting source data";
+                case FEATURIZING -> "Computing tactical features";
+                case SYNTHESIZING -> "Synthesizing insights";
+                case COMPOSING -> "Composing final report";
+                case READY -> "Report ready";
+                case FAILED -> "Processing failed";
+            };
+        }
+
+        return switch (status) {
+            case PENDING -> "Queued for processing";
+            case PROCESSING -> "Analyzing team data";
+            case COMPLETED -> "Report ready";
+            case FAILED -> "Processing failed";
+        };
     }
 
     private String extractSummary(ScoutingReport report) {
@@ -204,29 +295,20 @@ public class ReportServiceImpl implements ReportService {
         return StringUtils.capitalize(key.replace("_", " "));
     }
 
-    private int calculateProgress(ReportRequest.ReportStatus status) {
-        return switch (status) {
-            case PENDING -> 0;
-            case PROCESSING -> 50;
-            case COMPLETED -> 100;
-            case FAILED -> -1;
-        };
-    }
-
-    private String getCurrentStep(ReportRequest.ReportStatus status) {
-        return switch (status) {
-            case PENDING -> "Queued for processing";
-            case PROCESSING -> "Analyzing team data";
-            case COMPLETED -> "Report ready";
-            case FAILED -> "Processing failed";
-        };
-    }
-
-    private ErrorClassification classifyError(ReportRequest.ReportStatus status, String errorMessage) {
-        if (status != ReportRequest.ReportStatus.FAILED) {
+    private ErrorClassification classifyError(ReportRequest request, ReportJob reportJob) {
+        if (request.getStatus() != ReportRequest.ReportStatus.FAILED) {
             return new ErrorClassification(null, null);
         }
 
+        if (reportJob != null && StringUtils.hasText(reportJob.getLastErrorCode())) {
+            ErrorCode mapped = safeParseErrorCode(reportJob.getLastErrorCode());
+            return new ErrorClassification(mapped, reportJob.getRetryable());
+        }
+
+        return classifyErrorFromMessage(request.getErrorMessage());
+    }
+
+    private ErrorClassification classifyErrorFromMessage(String errorMessage) {
         if (!StringUtils.hasText(errorMessage)) {
             return new ErrorClassification(ErrorCode.NON_RETRYABLE_DATA, false);
         }
@@ -259,6 +341,14 @@ public class ReportServiceImpl implements ReportService {
         return new ErrorClassification(ErrorCode.NON_RETRYABLE_DATA, false);
     }
 
+    private ErrorCode safeParseErrorCode(String raw) {
+        try {
+            return ErrorCode.valueOf(raw);
+        } catch (Exception ignored) {
+            return ErrorCode.UNKNOWN;
+        }
+    }
+
     private void validateRequest(GenerateReportRequest request) {
         if (request == null || !StringUtils.hasText(request.getUserPrompt())) {
             throw new IllegalArgumentException("User prompt cannot be empty");
@@ -268,6 +358,21 @@ public class ReportServiceImpl implements ReportService {
         }
         if (request.getUserPrompt().length() > 500) {
             throw new IllegalArgumentException("User prompt is too long (max 500 characters)");
+        }
+    }
+
+    private String hashPrompt(String prompt) {
+        String normalized = prompt == null ? "" : prompt.trim().toLowerCase(Locale.ROOT).replaceAll("\\s+", " ");
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hashed = digest.digest(normalized.getBytes(StandardCharsets.UTF_8));
+            StringBuilder builder = new StringBuilder();
+            for (byte b : hashed) {
+                builder.append(String.format("%02x", b));
+            }
+            return builder.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 hashing unavailable", e);
         }
     }
 
@@ -281,4 +386,3 @@ public class ReportServiceImpl implements ReportService {
         }
     }
 }
-
