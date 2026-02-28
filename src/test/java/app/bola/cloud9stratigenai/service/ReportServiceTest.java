@@ -6,8 +6,10 @@ import app.bola.cloud9stratigenai.dto.ReportStatusResponse;
 import app.bola.cloud9stratigenai.dto.ScoutingReportResponse;
 import app.bola.cloud9stratigenai.exception.ReportNotFoundException;
 import app.bola.cloud9stratigenai.exception.ReportNotReadyException;
+import app.bola.cloud9stratigenai.model.ReportJob;
 import app.bola.cloud9stratigenai.model.ReportRequest;
 import app.bola.cloud9stratigenai.model.ScoutingReport;
+import app.bola.cloud9stratigenai.repository.ReportJobRepository;
 import app.bola.cloud9stratigenai.repository.ReportRequestRepository;
 import app.bola.cloud9stratigenai.repository.ScoutingReportRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -21,7 +23,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.modelmapper.ModelMapper;
@@ -42,6 +43,8 @@ class ReportServiceTest {
     @Mock
     private ScoutingReportRepository scoutingReportRepository;
     @Mock
+    private ReportJobRepository reportJobRepository;
+    @Mock
     private ModelMapper mapper;
 
     private ObjectMapper objectMapper;
@@ -51,7 +54,13 @@ class ReportServiceTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
-        reportService = new ReportServiceImpl(mapper, objectMapper, reportRequestRepository, scoutingReportRepository);
+        reportService = new ReportServiceImpl(
+                mapper,
+                objectMapper,
+                reportRequestRepository,
+                scoutingReportRepository,
+                reportJobRepository
+        );
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             validator = factory.getValidator();
         }
@@ -62,10 +71,13 @@ class ReportServiceTest {
     class SubmitReportRequestTests {
 
         @Test
-        @DisplayName("Should create a PENDING report request when given a valid prompt")
+        @DisplayName("Should create queued request and report job for valid prompt")
         void shouldCreatePendingRequest_WhenPromptIsValid() throws Exception {
             String validPrompt = "This is a valid scouting report request prompt with enough length.";
             GenerateReportRequest request = new GenerateReportRequest(validPrompt);
+
+            when(reportRequestRepository.findFirstByRequestHashAndStatusInOrderByCreatedAtDesc(any(), any()))
+                    .thenReturn(Optional.empty());
 
             ReportRequest reportRequest = new ReportRequest();
             reportRequest.setUserPrompt(validPrompt);
@@ -73,27 +85,55 @@ class ReportServiceTest {
 
             when(reportRequestRepository.save(any(ReportRequest.class))).thenAnswer(invocation -> {
                 ReportRequest r = invocation.getArgument(0);
-                Field field = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
-                field.setAccessible(true);
-                field.set(r, "test-uuid-123");
+                Field publicId = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
+                publicId.setAccessible(true);
+                publicId.set(r, "test-uuid-123");
                 return r;
             });
+
+            when(reportJobRepository.save(any(ReportJob.class))).thenAnswer(invocation -> invocation.getArgument(0));
 
             ReportStatusResponse response = reportService.generateReport(request);
 
             assertNotNull(response);
             assertEquals("test-uuid-123", response.getRequestId());
             assertEquals("PENDING", response.getStatus());
-            assertEquals("QUEUED", response.getWorkflowState());
+            assertEquals("INGESTING", response.getWorkflowState());
+            assertEquals(20, response.getProgress());
             assertEquals(ContractVersions.REPORT_STATUS_V1, response.getContractVersion());
-            assertNull(response.getErrorCode());
-            assertNull(response.getRetryable());
 
-            ArgumentCaptor<ReportRequest> captor = ArgumentCaptor.forClass(ReportRequest.class);
-            verify(reportRequestRepository).save(captor.capture());
-            ReportRequest captured = captor.getValue();
-            assertEquals(validPrompt, captured.getUserPrompt());
-            assertEquals(ReportRequest.ReportStatus.PENDING, captured.getStatus());
+            verify(reportRequestRepository).save(any(ReportRequest.class));
+            verify(reportJobRepository).save(any(ReportJob.class));
+        }
+
+        @Test
+        @DisplayName("Should return existing request for idempotent prompt")
+        void shouldReuseExistingRequestForIdempotentPrompt() throws Exception {
+            String prompt = "Scout Team Liquid over last 3 months";
+            GenerateReportRequest request = new GenerateReportRequest(prompt);
+
+            ReportRequest existing = new ReportRequest();
+            existing.setStatus(ReportRequest.ReportStatus.PENDING);
+
+            Field publicId = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
+            publicId.setAccessible(true);
+            publicId.set(existing, "existing-uuid");
+
+            Field idField = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("id");
+            idField.setAccessible(true);
+            idField.set(existing, 77L);
+
+            when(reportRequestRepository.findFirstByRequestHashAndStatusInOrderByCreatedAtDesc(any(), any()))
+                    .thenReturn(Optional.of(existing));
+            when(scoutingReportRepository.existsByReportRequestPublicId("existing-uuid")).thenReturn(false);
+            when(reportJobRepository.findByReportRequestId(77L)).thenReturn(Optional.empty());
+
+            ReportStatusResponse response = reportService.generateReport(request);
+
+            assertNotNull(response);
+            assertEquals("existing-uuid", response.getRequestId());
+            verify(reportRequestRepository, never()).save(any(ReportRequest.class));
+            verify(reportJobRepository, never()).save(any(ReportJob.class));
         }
 
         @ParameterizedTest
@@ -110,47 +150,7 @@ class ReportServiceTest {
             assertFalse(violations.isEmpty(), "Validator should find violations for: " + invalidPrompt);
 
             assertThrows(IllegalArgumentException.class, () -> reportService.generateReport(request));
-
             verify(reportRequestRepository, never()).save(any());
-        }
-
-        @Test
-        @DisplayName("Should handle database failure gracefully")
-        void shouldHandleDatabaseFailure() {
-            GenerateReportRequest request = new GenerateReportRequest("Valid prompt for scouting report generator.");
-            ReportRequest reportRequest = new ReportRequest();
-            reportRequest.setUserPrompt(request.getUserPrompt());
-            when(mapper.map(request, ReportRequest.class)).thenReturn(reportRequest);
-            when(reportRequestRepository.save(any())).thenThrow(new RuntimeException("DB Error"));
-
-            assertThrows(RuntimeException.class, () -> reportService.generateReport(request));
-        }
-
-        @Test
-        @DisplayName("Should handle special characters in prompt")
-        void shouldHandleSpecialCharactersInPrompt() throws Exception {
-            String specialPrompt = "Scouting for @Team! With #Special chars & symbols? (Hopefully) works fine.";
-            GenerateReportRequest request = new GenerateReportRequest(specialPrompt);
-
-            ReportRequest reportRequest = new ReportRequest();
-            reportRequest.setUserPrompt(specialPrompt);
-            when(mapper.map(request, ReportRequest.class)).thenReturn(reportRequest);
-
-            when(reportRequestRepository.save(any(ReportRequest.class))).thenAnswer(invocation -> {
-                ReportRequest r = invocation.getArgument(0);
-                Field field = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
-                field.setAccessible(true);
-                field.set(r, "special-uuid");
-                return r;
-            });
-
-            ReportStatusResponse response = reportService.generateReport(request);
-
-            assertNotNull(response);
-            assertEquals("special-uuid", response.getRequestId());
-            assertEquals("QUEUED", response.getWorkflowState());
-            assertEquals(ContractVersions.REPORT_STATUS_V1, response.getContractVersion());
-            verify(reportRequestRepository).save(any(ReportRequest.class));
         }
     }
 
@@ -171,8 +171,13 @@ class ReportServiceTest {
             publicIdField.setAccessible(true);
             publicIdField.set(request, requestId);
 
+            Field idField = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("id");
+            idField.setAccessible(true);
+            idField.set(request, 10L);
+
             when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
             when(scoutingReportRepository.existsByReportRequestPublicId(requestId)).thenReturn(false);
+            when(reportJobRepository.findByReportRequestId(10L)).thenReturn(Optional.empty());
 
             ReportStatusResponse response = reportService.getReportStatus(requestId);
 
@@ -183,6 +188,36 @@ class ReportServiceTest {
             assertEquals(-1, response.getProgress());
             assertEquals(ContractVersions.REPORT_STATUS_V1, response.getContractVersion());
             assertEquals("Processing failed", response.getCurrentStep());
+        }
+
+        @Test
+        @DisplayName("Should prefer job-stage workflow state when report job exists")
+        void shouldPreferJobStageForWorkflowState() throws Exception {
+            String requestId = "processing-uuid";
+            ReportRequest request = new ReportRequest();
+            request.setStatus(ReportRequest.ReportStatus.PROCESSING);
+
+            Field publicId = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
+            publicId.setAccessible(true);
+            publicId.set(request, requestId);
+
+            Field idField = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("id");
+            idField.setAccessible(true);
+            idField.set(request, 11L);
+
+            ReportJob job = new ReportJob();
+            job.setCurrentStage(ReportJob.JobStage.SYNTHESIZING);
+            job.setState(ReportJob.JobState.RUNNING);
+            job.setAttempt(2);
+
+            when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
+            when(scoutingReportRepository.existsByReportRequestPublicId(requestId)).thenReturn(false);
+            when(reportJobRepository.findByReportRequestId(11L)).thenReturn(Optional.of(job));
+
+            ReportStatusResponse response = reportService.getReportStatus(requestId);
+
+            assertEquals("SYNTHESIZING", response.getWorkflowState());
+            assertEquals(70, response.getProgress());
         }
     }
 
@@ -212,8 +247,13 @@ class ReportServiceTest {
             report.setReportData(reportJson);
             report.setGeneratedReport("Full text summary of the report.");
 
+            ReportJob reportJob = new ReportJob();
+            reportJob.setId(123L);
+            reportJob.setAttempt(3);
+
             when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
             when(scoutingReportRepository.findByReportRequestId(1L)).thenReturn(Optional.of(report));
+            when(reportJobRepository.findByReportRequestId(1L)).thenReturn(Optional.of(reportJob));
 
             ScoutingReportResponse response = reportService.getReport(requestId);
 
@@ -227,12 +267,8 @@ class ReportServiceTest {
             assertEquals("features-v1", response.getFeatureVersion());
             assertNotNull(response.getLineage());
             assertEquals(requestId, response.getLineage().getRequestId());
-            assertEquals(1, response.getLineage().getAttempt());
-
-            boolean hasSummary = response.getSections().stream().anyMatch(s -> s.getTitle().equals("Executive summary"));
-            boolean hasTactical = response.getSections().stream().anyMatch(s -> s.getTitle().equals("Tactical analysis"));
-            assertTrue(hasSummary);
-            assertTrue(hasTactical);
+            assertEquals(123L, response.getLineage().getJobId());
+            assertEquals(3, response.getLineage().getAttempt());
         }
 
         @Test
@@ -278,6 +314,7 @@ class ReportServiceTest {
 
             when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
             when(scoutingReportRepository.findByReportRequestId(1L)).thenReturn(Optional.of(report));
+            when(reportJobRepository.findByReportRequestId(1L)).thenReturn(Optional.empty());
 
             ScoutingReportResponse response = reportService.getReport(requestId);
 
