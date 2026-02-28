@@ -21,10 +21,26 @@ public class SecurityConfig {
     public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
         http
             .csrf(AbstractHttpConfigurer::disable)
+            .cors(cors -> cors.configurationSource(corsConfigurationSource()))
             .authorizeHttpRequests(auth -> auth
-                .requestMatchers("/api/reports/**").permitAll()
+                .requestMatchers("/api/reports/**", "/api/health/**").permitAll()
                 .anyRequest().authenticated()
             );
         return http.build();
+    }
+    
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(Arrays.asList("http://localhost:3000", "http://127.0.0.1:3000"));
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"));
+        configuration.setAllowedHeaders(Arrays.asList("*"));
+        configuration.setAllowCredentials(true);
+        configuration.setExposedHeaders(Arrays.asList("Authorization", "Content-Type"));
+        configuration.setMaxAge(3600L);
+        
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
     }
 }
