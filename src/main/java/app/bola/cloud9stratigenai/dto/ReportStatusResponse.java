@@ -19,4 +19,10 @@ public class ReportStatusResponse {
     private LocalDateTime createdAt;
     private Boolean reportAvailable;
     private LocalDateTime completedAt;
+
+    // Additive v1 hardening fields
+    private String workflowState;
+    private String errorCode;
+    private Boolean retryable;
+    private String contractVersion;
 }
