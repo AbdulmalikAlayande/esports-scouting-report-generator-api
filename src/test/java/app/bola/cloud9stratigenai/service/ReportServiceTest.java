@@ -6,9 +6,11 @@ import app.bola.cloud9stratigenai.dto.ReportStatusResponse;
 import app.bola.cloud9stratigenai.dto.ScoutingReportResponse;
 import app.bola.cloud9stratigenai.exception.ReportNotFoundException;
 import app.bola.cloud9stratigenai.exception.ReportNotReadyException;
+import app.bola.cloud9stratigenai.model.ReportArtifact;
 import app.bola.cloud9stratigenai.model.ReportJob;
 import app.bola.cloud9stratigenai.model.ReportRequest;
 import app.bola.cloud9stratigenai.model.ScoutingReport;
+import app.bola.cloud9stratigenai.repository.ReportArtifactRepository;
 import app.bola.cloud9stratigenai.repository.ReportJobRepository;
 import app.bola.cloud9stratigenai.repository.ReportRequestRepository;
 import app.bola.cloud9stratigenai.repository.ScoutingReportRepository;
@@ -43,6 +45,8 @@ class ReportServiceTest {
     @Mock
     private ScoutingReportRepository scoutingReportRepository;
     @Mock
+    private ReportArtifactRepository reportArtifactRepository;
+    @Mock
     private ReportJobRepository reportJobRepository;
     @Mock
     private ModelMapper mapper;
@@ -59,8 +63,11 @@ class ReportServiceTest {
                 objectMapper,
                 reportRequestRepository,
                 scoutingReportRepository,
+                reportArtifactRepository,
                 reportJobRepository
         );
+        lenient().when(reportArtifactRepository.findByReportRequestId(any(Long.class))).thenReturn(Optional.empty());
+        lenient().when(reportArtifactRepository.existsByReportRequestPublicId(any())).thenReturn(false);
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             validator = factory.getValidator();
         }
@@ -272,6 +279,53 @@ class ReportServiceTest {
         }
 
         @Test
+        @DisplayName("Should prefer report_artifacts read-model when artifact exists")
+        void shouldPreferArtifactReadModel_WhenArtifactExists() throws Exception {
+            String requestId = "artifact-uuid";
+            ReportRequest request = new ReportRequest();
+            request.setStatus(ReportRequest.ReportStatus.COMPLETED);
+
+            Field publicIdField = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("publicId");
+            publicIdField.setAccessible(true);
+            publicIdField.set(request, requestId);
+
+            Field idField = app.bola.cloud9stratigenai.common.model.BaseModel.class.getDeclaredField("id");
+            idField.setAccessible(true);
+            idField.set(request, 2L);
+
+            ReportArtifact artifact = new ReportArtifact();
+            artifact.setReportRequest(request);
+            artifact.setReportType("full");
+            artifact.setContractVersion("scouting-report.v1");
+            artifact.setModelVersion("gemini-3-flash");
+            artifact.setFeatureVersion("features-v2");
+            artifact.setSummary("Artifact summary");
+            artifact.setReportJson("{\"flash_card\": {\"game_plan\": [\"Take space\"]}, \"metadata\": {\"feature_version\": \"features-v2\"}}");
+            artifact.setGeneratedAt(LocalDateTime.now());
+            artifact.setCreatedAt(LocalDateTime.now());
+
+            ReportJob reportJob = new ReportJob();
+            reportJob.setId(88L);
+            reportJob.setAttempt(1);
+
+            when(reportRequestRepository.findByPublicId(requestId)).thenReturn(Optional.of(request));
+            when(reportArtifactRepository.findByReportRequestId(2L)).thenReturn(Optional.of(artifact));
+            when(reportJobRepository.findByReportRequestId(2L)).thenReturn(Optional.of(reportJob));
+
+            ScoutingReportResponse response = reportService.getReport(requestId);
+
+            assertNotNull(response);
+            assertEquals("full", response.getReportType());
+            assertEquals("Artifact summary", response.getSummary());
+            assertEquals("scouting-report.v1", response.getContractVersion());
+            assertEquals("gemini-3-flash", response.getModelVersion());
+            assertEquals("features-v2", response.getFeatureVersion());
+            assertEquals(88L, response.getLineage().getJobId());
+
+            verify(scoutingReportRepository, never()).findByReportRequestId(any());
+        }
+
+        @Test
         @DisplayName("Should throw ReportNotReadyException when status is PENDING")
         void shouldThrowNotReady_WhenPending() {
             String requestId = "pending-uuid";
@@ -326,3 +380,13 @@ class ReportServiceTest {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
