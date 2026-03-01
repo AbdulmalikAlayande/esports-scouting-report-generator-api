@@ -9,9 +9,11 @@ import app.bola.cloud9stratigenai.dto.ReportStatusResponse;
 import app.bola.cloud9stratigenai.dto.ScoutingReportResponse;
 import app.bola.cloud9stratigenai.exception.ReportNotFoundException;
 import app.bola.cloud9stratigenai.exception.ReportNotReadyException;
+import app.bola.cloud9stratigenai.model.ReportArtifact;
 import app.bola.cloud9stratigenai.model.ReportJob;
 import app.bola.cloud9stratigenai.model.ReportRequest;
 import app.bola.cloud9stratigenai.model.ScoutingReport;
+import app.bola.cloud9stratigenai.repository.ReportArtifactRepository;
 import app.bola.cloud9stratigenai.repository.ReportJobRepository;
 import app.bola.cloud9stratigenai.repository.ReportRequestRepository;
 import app.bola.cloud9stratigenai.repository.ScoutingReportRepository;
@@ -46,6 +48,7 @@ public class ReportServiceImpl implements ReportService {
     private final ObjectMapper objectMapper;
     private final ReportRequestRepository reportRequestRepository;
     private final ScoutingReportRepository scoutingReportRepository;
+    private final ReportArtifactRepository reportArtifactRepository;
     private final ReportJobRepository reportJobRepository;
 
     @Override
@@ -61,7 +64,7 @@ public class ReportServiceImpl implements ReportService {
 
         if (existing.isPresent()) {
             ReportRequest existingRequest = existing.get();
-            boolean reportAvailable = scoutingReportRepository.existsByReportRequestPublicId(existingRequest.getPublicId());
+            boolean reportAvailable = isReportAvailable(existingRequest.getPublicId());
             return buildReportStatusResponse(existingRequest, reportAvailable, reportJobRepository.findByReportRequestId(existingRequest.getId()).orElse(null));
         }
 
@@ -87,7 +90,7 @@ public class ReportServiceImpl implements ReportService {
     @Transactional(readOnly = true)
     public ReportStatusResponse getReportStatus(String requestId) {
         ReportRequest request = findRequestOrThrow(requestId);
-        boolean isAvailable = scoutingReportRepository.existsByReportRequestPublicId(requestId);
+        boolean isAvailable = isReportAvailable(requestId);
         ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
         return buildReportStatusResponse(request, isAvailable, reportJob);
     }
@@ -99,10 +102,17 @@ public class ReportServiceImpl implements ReportService {
         if (request.getStatus() != ReportRequest.ReportStatus.COMPLETED) {
             throw new ReportNotReadyException(requestId);
         }
+
+        ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
+
+        Optional<ReportArtifact> reportArtifact = reportArtifactRepository.findByReportRequestId(request.getId());
+        if (reportArtifact.isPresent()) {
+            return mapArtifactToResponse(request, reportArtifact.get(), reportJob);
+        }
+
         ScoutingReport scoutingReport = scoutingReportRepository.findByReportRequestId(request.getId())
                 .orElseThrow(() -> new ReportNotFoundException("Scouting report data not found for request: " + requestId));
-        ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
-        return mapToResponse(scoutingReport, reportJob);
+        return mapLegacyReportToResponse(scoutingReport, reportJob);
     }
 
     private ReportRequest findRequestOrThrow(String publicId) {
@@ -110,7 +120,29 @@ public class ReportServiceImpl implements ReportService {
                 .orElseThrow(() -> new ReportNotFoundException(publicId));
     }
 
-    private ScoutingReportResponse mapToResponse(ScoutingReport report, ReportJob reportJob) {
+    private ScoutingReportResponse mapArtifactToResponse(ReportRequest request, ReportArtifact artifact, ReportJob reportJob) {
+        JsonNode reportRoot = parseReportRoot(artifact.getReportJson());
+
+        return ScoutingReportResponse.builder()
+                .requestId(request.getPublicId())
+                .reportType(artifact.getReportType())
+                .reportTitle(buildTitle(artifact.getReportType()))
+                .summary(StringUtils.hasText(artifact.getSummary()) ? artifact.getSummary() : "Report generated at " + artifact.getGeneratedAt())
+                .createdAt(artifact.getCreatedAt())
+                .sections(parseSections(reportRoot))
+                .contractVersion(StringUtils.hasText(artifact.getContractVersion()) ? artifact.getContractVersion() : ContractVersions.SCOUTING_REPORT_V1)
+                .modelVersion(StringUtils.hasText(artifact.getModelVersion()) ? artifact.getModelVersion() : readMetadataField(reportRoot, "model_version", "legacy-v0"))
+                .featureVersion(StringUtils.hasText(artifact.getFeatureVersion()) ? artifact.getFeatureVersion() : readMetadataField(reportRoot, "feature_version", "legacy-v0"))
+                .generatedAt(artifact.getGeneratedAt())
+                .lineage(ScoutingReportResponse.Lineage.builder()
+                        .requestId(request.getPublicId())
+                        .jobId(reportJob != null ? reportJob.getId() : null)
+                        .attempt(reportJob != null ? reportJob.getAttempt() : 1)
+                        .build())
+                .build();
+    }
+
+    private ScoutingReportResponse mapLegacyReportToResponse(ScoutingReport report, ReportJob reportJob) {
         JsonNode reportRoot = parseReportRoot(report.getReportData());
 
         return ScoutingReportResponse.builder()
@@ -206,6 +238,11 @@ public class ReportServiceImpl implements ReportService {
             case COMPLETED -> "Report ready";
             case FAILED -> "Processing failed";
         };
+    }
+
+    private boolean isReportAvailable(String requestId) {
+        return reportArtifactRepository.existsByReportRequestPublicId(requestId)
+                || scoutingReportRepository.existsByReportRequestPublicId(requestId);
     }
 
     private String extractSummary(ScoutingReport report) {
@@ -386,3 +423,4 @@ public class ReportServiceImpl implements ReportService {
         }
     }
 }
+
