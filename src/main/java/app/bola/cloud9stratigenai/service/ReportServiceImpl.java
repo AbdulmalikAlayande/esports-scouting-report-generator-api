@@ -2,6 +2,7 @@ package app.bola.cloud9stratigenai.service;
 
 import app.bola.cloud9stratigenai.contracts.ContractVersions;
 import app.bola.cloud9stratigenai.contracts.ErrorCode;
+import app.bola.cloud9stratigenai.contracts.ReportContractV1Mapper;
 import app.bola.cloud9stratigenai.contracts.ReportStateMapper;
 import app.bola.cloud9stratigenai.contracts.WorkflowState;
 import app.bola.cloud9stratigenai.dto.GenerateReportRequest;
@@ -17,8 +18,6 @@ import app.bola.cloud9stratigenai.repository.ReportArtifactRepository;
 import app.bola.cloud9stratigenai.repository.ReportJobRepository;
 import app.bola.cloud9stratigenai.repository.ReportRequestRepository;
 import app.bola.cloud9stratigenai.repository.ScoutingReportRepository;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.modelmapper.ModelMapper;
@@ -30,12 +29,9 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 @Service
@@ -45,11 +41,11 @@ public class ReportServiceImpl implements ReportService {
     private static final int DEFAULT_MAX_ATTEMPTS = 5;
 
     private final ModelMapper mapper;
-    private final ObjectMapper objectMapper;
     private final ReportRequestRepository reportRequestRepository;
     private final ScoutingReportRepository scoutingReportRepository;
     private final ReportArtifactRepository reportArtifactRepository;
     private final ReportJobRepository reportJobRepository;
+    private final ReportContractV1Mapper reportContractV1Mapper;
 
     @Override
     @Transactional
@@ -65,7 +61,8 @@ public class ReportServiceImpl implements ReportService {
         if (existing.isPresent()) {
             ReportRequest existingRequest = existing.get();
             boolean reportAvailable = isReportAvailable(existingRequest.getPublicId());
-            return buildReportStatusResponse(existingRequest, reportAvailable, reportJobRepository.findByReportRequestId(existingRequest.getId()).orElse(null));
+            ReportJob existingJob = reportJobRepository.findByReportRequestId(existingRequest.getId()).orElse(null);
+            return buildReportStatusResponse(existingRequest, reportAvailable, existingJob);
         }
 
         ReportRequest reportRequest = mapper.map(request, ReportRequest.class);
@@ -104,64 +101,21 @@ public class ReportServiceImpl implements ReportService {
         }
 
         ReportJob reportJob = reportJobRepository.findByReportRequestId(request.getId()).orElse(null);
-
         Optional<ReportArtifact> reportArtifact = reportArtifactRepository.findByReportRequestId(request.getId());
+
         if (reportArtifact.isPresent()) {
-            return mapArtifactToResponse(request, reportArtifact.get(), reportJob);
+            return reportContractV1Mapper.fromArtifact(request, reportArtifact.get(), reportJob);
         }
 
         ScoutingReport scoutingReport = scoutingReportRepository.findByReportRequestId(request.getId())
                 .orElseThrow(() -> new ReportNotFoundException("Scouting report data not found for request: " + requestId));
-        return mapLegacyReportToResponse(scoutingReport, reportJob);
+
+        return reportContractV1Mapper.fromLegacy(scoutingReport, reportJob);
     }
 
     private ReportRequest findRequestOrThrow(String publicId) {
         return reportRequestRepository.findByPublicId(publicId)
                 .orElseThrow(() -> new ReportNotFoundException(publicId));
-    }
-
-    private ScoutingReportResponse mapArtifactToResponse(ReportRequest request, ReportArtifact artifact, ReportJob reportJob) {
-        JsonNode reportRoot = parseReportRoot(artifact.getReportJson());
-
-        return ScoutingReportResponse.builder()
-                .requestId(request.getPublicId())
-                .reportType(artifact.getReportType())
-                .reportTitle(buildTitle(artifact.getReportType()))
-                .summary(StringUtils.hasText(artifact.getSummary()) ? artifact.getSummary() : "Report generated at " + artifact.getGeneratedAt())
-                .createdAt(artifact.getCreatedAt())
-                .sections(parseSections(reportRoot))
-                .contractVersion(StringUtils.hasText(artifact.getContractVersion()) ? artifact.getContractVersion() : ContractVersions.SCOUTING_REPORT_V1)
-                .modelVersion(StringUtils.hasText(artifact.getModelVersion()) ? artifact.getModelVersion() : readMetadataField(reportRoot, "model_version", "legacy-v0"))
-                .featureVersion(StringUtils.hasText(artifact.getFeatureVersion()) ? artifact.getFeatureVersion() : readMetadataField(reportRoot, "feature_version", "legacy-v0"))
-                .generatedAt(artifact.getGeneratedAt())
-                .lineage(ScoutingReportResponse.Lineage.builder()
-                        .requestId(request.getPublicId())
-                        .jobId(reportJob != null ? reportJob.getId() : null)
-                        .attempt(reportJob != null ? reportJob.getAttempt() : 1)
-                        .build())
-                .build();
-    }
-
-    private ScoutingReportResponse mapLegacyReportToResponse(ScoutingReport report, ReportJob reportJob) {
-        JsonNode reportRoot = parseReportRoot(report.getReportData());
-
-        return ScoutingReportResponse.builder()
-                .requestId(report.getReportRequest().getPublicId())
-                .reportType(report.getReportType())
-                .reportTitle(buildTitle(report.getReportType()))
-                .summary(extractSummary(report))
-                .createdAt(report.getCreatedAt())
-                .sections(parseSections(reportRoot))
-                .contractVersion(ContractVersions.SCOUTING_REPORT_V1)
-                .modelVersion(readMetadataField(reportRoot, "model_version", "legacy-v0"))
-                .featureVersion(readMetadataField(reportRoot, "feature_version", "legacy-v0"))
-                .generatedAt(report.getCreatedAt())
-                .lineage(ScoutingReportResponse.Lineage.builder()
-                        .requestId(report.getReportRequest().getPublicId())
-                        .jobId(reportJob != null ? reportJob.getId() : null)
-                        .attempt(reportJob != null ? reportJob.getAttempt() : 1)
-                        .build())
-                .build();
     }
 
     private ReportStatusResponse buildReportStatusResponse(ReportRequest request, boolean reportAvailable, ReportJob reportJob) {
@@ -245,13 +199,6 @@ public class ReportServiceImpl implements ReportService {
                 || scoutingReportRepository.existsByReportRequestPublicId(requestId);
     }
 
-    private String extractSummary(ScoutingReport report) {
-        if (StringUtils.hasText(report.getGeneratedReport())) {
-            return report.getGeneratedReport();
-        }
-        return "Report generated at " + report.getCreatedAt();
-    }
-
     private String getErrorMessage(ReportRequest request) {
         if (request.getStatus() == ReportRequest.ReportStatus.FAILED) {
             return StringUtils.hasText(request.getErrorMessage())
@@ -259,77 +206,6 @@ public class ReportServiceImpl implements ReportService {
                     : "Processing failed";
         }
         return null;
-    }
-
-    private String buildTitle(String reportType) {
-        if (reportType == null || reportType.isEmpty()) {
-            return "Scouting Report";
-        }
-        return "Scouting Report - " +
-                reportType.replace("_", " ").toUpperCase();
-    }
-
-    private JsonNode parseReportRoot(String reportData) {
-        if (!StringUtils.hasText(reportData)) {
-            return null;
-        }
-        try {
-            JsonNode root = objectMapper.readTree(reportData);
-            if (root == null || !root.isObject()) {
-                return null;
-            }
-            return root;
-        } catch (Exception e) {
-            log.error("Failed to parse report data", e);
-            return null;
-        }
-    }
-
-    private List<ScoutingReportResponse.ReportSection> parseSections(JsonNode root) {
-        if (root == null || !root.isObject()) {
-            return Collections.emptyList();
-        }
-
-        List<ScoutingReportResponse.ReportSection> sections = new ArrayList<>();
-        AtomicInteger order = new AtomicInteger(1);
-        root.fields().forEachRemaining(entry -> {
-            if ("metadata".equals(entry.getKey())) {
-                return;
-            }
-            sections.add(
-                    ScoutingReportResponse.ReportSection
-                            .builder()
-                            .title(formatTitle(entry.getKey()))
-                            .content(entry.getValue().toString())
-                            .order(order.getAndIncrement())
-                            .build()
-            );
-        });
-
-        return sections;
-    }
-
-    private String readMetadataField(JsonNode root, String key, String fallback) {
-        if (root == null) {
-            return fallback;
-        }
-
-        JsonNode metadata = root.path("metadata");
-        if (metadata.isMissingNode() || !metadata.isObject()) {
-            return fallback;
-        }
-
-        JsonNode value = metadata.path(key);
-        if (value.isTextual() && StringUtils.hasText(value.asText())) {
-            return value.asText();
-        }
-
-        return fallback;
-    }
-
-    private String formatTitle(String key) {
-        if (key == null || key.isEmpty()) return "";
-        return StringUtils.capitalize(key.replace("_", " "));
     }
 
     private ErrorClassification classifyError(ReportRequest request, ReportJob reportJob) {
