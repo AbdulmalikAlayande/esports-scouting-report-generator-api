@@ -1,6 +1,7 @@
 package app.bola.cloud9stratigenai.service;
 
 import app.bola.cloud9stratigenai.contracts.ContractVersions;
+import app.bola.cloud9stratigenai.contracts.ReportContractV1Mapper;
 import app.bola.cloud9stratigenai.dto.GenerateReportRequest;
 import app.bola.cloud9stratigenai.dto.ReportStatusResponse;
 import app.bola.cloud9stratigenai.dto.ScoutingReportResponse;
@@ -58,13 +59,14 @@ class ReportServiceTest {
     @BeforeEach
     void setUp() {
         objectMapper = new ObjectMapper();
+        ReportContractV1Mapper reportContractV1Mapper = new ReportContractV1Mapper(objectMapper);
         reportService = new ReportServiceImpl(
                 mapper,
-                objectMapper,
                 reportRequestRepository,
                 scoutingReportRepository,
                 reportArtifactRepository,
-                reportJobRepository
+                reportJobRepository,
+                reportContractV1Mapper
         );
         lenient().when(reportArtifactRepository.findByReportRequestId(any(Long.class))).thenReturn(Optional.empty());
         lenient().when(reportArtifactRepository.existsByReportRequestPublicId(any())).thenReturn(false);
@@ -380,13 +382,3 @@ class ReportServiceTest {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
